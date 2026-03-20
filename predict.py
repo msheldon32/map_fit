@@ -521,6 +521,75 @@ def _teacher_forcing_preds(model, train_data: np.ndarray, val_data: np.ndarray,
 
 
 @torch.no_grad()
+def _train_residuals(model, train_data: np.ndarray,
+                     device: str = DEVICE) -> np.ndarray:
+    """Teacher-forcing pass over training data; returns residuals in log-norm space.
+
+    Runs from a cold start (no prior warm-up), so early residuals may be
+    slightly inflated while the state accumulates history.  In practice the
+    state settles within a few hundred steps, which is negligible relative to
+    the ~800 k training samples.
+    """
+    model.eval()
+    tr     = torch.FloatTensor(train_data).to(device)
+    states = None
+    preds  = []
+    for t in range(0, len(tr) - 1, CHUNK_SIZE):
+        chunk_in = tr[t : t + CHUNK_SIZE].unsqueeze(0).unsqueeze(-1)
+        if chunk_in.shape[1] == 0:
+            break
+        pred, states = model(chunk_in, states)
+        n_known = min(pred.shape[1], len(tr) - t - 1)
+        preds.extend(pred.squeeze(0)[:n_known].cpu().tolist())
+    preds = np.array(preds)
+    trues = train_data[1 : len(preds) + 1]
+    return trues - preds   # ε_t = x_true[t+1] − pred[t]
+
+
+@torch.no_grad()
+def _bootstrap_train_iats(model, train_data: np.ndarray,
+                           mean: float, std: float,
+                           residuals: np.ndarray, n_gen: int,
+                           noise_block_size: int, noise_scale: float,
+                           seed: int, device: str = DEVICE) -> np.ndarray:
+    """Generate n_gen IATs autoregressively, injecting block-bootstrapped
+    training residuals at each step.
+
+    Unlike teacher forcing this mode never sees validation data: it warms up
+    on training data, then feeds each noisy prediction back as the next input.
+    The noise is pre-sampled from the training residual distribution so the
+    generated marginal matches what the model saw during training.
+    """
+    model.eval()
+    tr = torch.FloatTensor(train_data).to(device)
+
+    # Warm up state over the full training set
+    states = None
+    for t in range(0, len(tr), CHUNK_SIZE):
+        chunk_in = tr[t : t + CHUNK_SIZE].unsqueeze(0).unsqueeze(-1)
+        if chunk_in.shape[1] == 0:
+            break
+        _, states = model(chunk_in, states)
+
+    # Pre-sample all noise from training residuals
+    rng   = np.random.default_rng(seed)
+    noise = _block_bootstrap(residuals, n_gen, noise_block_size, rng) * noise_scale
+
+    # Seed the autoregressive loop with the last training value
+    x = torch.tensor([[[train_data[-1]]]], dtype=torch.float32, device=device)
+    pred, states = model(x, states)
+
+    iats_raw = np.empty(n_gen, dtype=np.float64)
+    for i in range(n_gen):
+        pred_norm   = pred[0, 0].item() + noise[i]
+        iats_raw[i] = 10 ** (pred_norm * std + mean)
+        x = torch.tensor([[[pred_norm]]], dtype=torch.float32, device=device)
+        pred, states = model(x, states)
+
+    return iats_raw
+
+
+@torch.no_grad()
 def _autoregressive_iats(model, train_data: np.ndarray, val_seed: float,
                           mean: float, std: float, n_gen: int,
                           noise_std: float = 0.0,
@@ -579,7 +648,7 @@ def _block_bootstrap(arr: np.ndarray, n: int, block_size: int,
 def queue_test(model, train_data: np.ndarray, val_data: np.ndarray,
                mean: float, std: float, raw_val: np.ndarray,
                mu: float = None, n_customers: int = None,
-               generation: str = "teacher", noise_std: float = 0.0,
+               generation: str = "bootstrap_train", noise_std: float = 0.0,
                calibrate_noise: bool = True, noise_block_size: int = 500,
                noise_scale: float = 1.0,
                name: str = "Model", device: str = DEVICE, seed: int = 42):
@@ -594,10 +663,15 @@ def queue_test(model, train_data: np.ndarray, val_data: np.ndarray,
                           bootstrapped residuals are added so the generated
                           sequence matches the trace's marginal distribution,
                           not just its conditional mean.
-        "autoregressive"— each prediction is fed back as the next input.
-                          Collapses to the conditional mean without noise;
-                          set noise_std ≈ val RMSE (log-norm space) to prevent
-                          this (e.g. noise_std=0.9 for a typical S4 run).
+        "autoregressive"  — each prediction is fed back as the next input.
+                            Collapses to the conditional mean without noise;
+                            set noise_std ≈ val RMSE (log-norm space) to prevent
+                            this (e.g. noise_std=0.9 for a typical S4 run).
+        "bootstrap_train" — autoregressive (never sees val data), but injects
+                            block-bootstrapped residuals drawn from the training
+                            set at each step.  Avoids exposure bias while keeping
+                            the generated distribution grounded in training
+                            statistics rather than validation ground truth.
 
     Why calibrate_noise matters
     ---------------------------
@@ -624,7 +698,7 @@ def queue_test(model, train_data: np.ndarray, val_data: np.ndarray,
     raw_val         : raw IATs (seconds) for the validation set
     mu              : service rate (1/s).  None → rho = 0.8 vs trace mean.
     n_customers     : customers to simulate (default 10 000)
-    generation      : "teacher" (default) or "autoregressive"
+    generation      : "teacher" (default), "autoregressive", or "bootstrap_train"
     noise_std       : std of noise injected in autoregressive mode (log-norm)
     calibrate_noise : add bootstrapped residuals in teacher mode (default True)
     name            : model label for output
@@ -644,7 +718,8 @@ def queue_test(model, train_data: np.ndarray, val_data: np.ndarray,
         mu = lam_trace / 0.80
     rho_trace = lam_trace / mu
 
-    mode_str = generation + ("+calibrated_noise" if generation == "teacher" and calibrate_noise else "")
+    mode_str = generation + ("+calibrated_noise" if generation == "teacher" and calibrate_noise else
+                             f"+train_residuals(scale={noise_scale})" if generation == "bootstrap_train" else "")
     print(f"\n{'─'*60}")
     print(f"Queue test  ({name}, {mode_str})")
     print(f"  customers  : {n:,}")
@@ -680,6 +755,15 @@ def queue_test(model, train_data: np.ndarray, val_data: np.ndarray,
                   f"block_size: {noise_block_size}  noise_scale: {noise_scale}")
         else:
             model_iats = 10 ** (preds_norm * std + mean)
+    elif generation == "bootstrap_train":
+        train_res = _train_residuals(model, train_data, device)
+        residual_rmse = float(np.sqrt(np.mean(train_res ** 2)))
+        print(f"  Train residual RMSE (log-norm): {residual_rmse:.4f}  "
+              f"block_size: {noise_block_size}  noise_scale: {noise_scale}")
+        model_iats = _bootstrap_train_iats(
+            model, train_data, mean, std, train_res,
+            n, noise_block_size, noise_scale, seed + 1, device
+        )
     else:
         model_iats = _autoregressive_iats(
             model, train_data, val_data[0], mean, std, n, noise_std, device
@@ -825,7 +909,7 @@ def main(retrain: bool = False):
         predictions[name] = (pred_norm, pred_raw)
 
         queue_test(model, train_data, val_data, mean, std, raw_val,
-                   noise_scale=2.0, name=name)
+                   noise_scale=1.75, name=name)
 
     print(f"\n{'='*60}")
     print("PREDICTION: 1,000,000th inter-arrival time in BCAUG89")
